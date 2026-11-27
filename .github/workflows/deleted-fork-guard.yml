@@ -1,0 +1,81 @@
+name: synthetic deleted-fork guard proof
+
+on:
+  pull_request_target:
+    types: [opened, closed]
+
+permissions:
+  contents: read
+
+jobs:
+  guard-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record bounded event facts
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          echo "EVENT_ACTION=$EVENT_ACTION"
+          if [ -z "$HEAD_REPO_ID" ]; then
+            echo "HEAD_REPOSITORY_NULL=true"
+          else
+            echo "HEAD_REPOSITORY_NULL=false"
+            echo "HEAD_REPOSITORY_ID=$HEAD_REPO_ID"
+            echo "HEAD_REPOSITORY_FULL_NAME=$HEAD_REPO_FULL_NAME"
+          fi
+          echo "EXPECTED_HEAD_SHA=$EXPECTED_HEAD_SHA"
+          echo "PR_NUMBER=$PR_NUMBER"
+          echo "EVENT_BASE_SHA=$EVENT_SHA"
+
+      - name: Guarded checkout without opt-in
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          path: pr-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Execute bounded hash-only fork payload
+        env:
+          SYNTHETIC_SECRET: ${{ secrets.SYNTHETIC_DELETED_FORK_SECRET }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVIDENCE_PATH: ${{ runner.temp }}/deleted-fork-proof.json
+        run: node pr-source/payload.cjs
+
+      - name: Independently verify protected secret hash and head binding
+        env:
+          SYNTHETIC_SECRET: ${{ secrets.SYNTHETIC_DELETED_FORK_SECRET }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVIDENCE_PATH: ${{ runner.temp }}/deleted-fork-proof.json
+        run: |
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const evidence = JSON.parse(fs.readFileSync(process.env.EVIDENCE_PATH, 'utf8'))
+          const expectedHash = crypto.createHash('sha256').update(process.env.SYNTHETIC_SECRET).digest('hex')
+          const assertions = {
+            exactPayload: evidence.payload_id === 'deleted-fork-hash-only-v1',
+            exactPr: evidence.pr_number === Number(process.env.PR_NUMBER),
+            exactHead: evidence.expected_head_sha === process.env.EXPECTED_HEAD_SHA,
+            closedEvent: evidence.event_action === process.env.EVENT_ACTION,
+            secretHash: evidence.secret_sha256 === expectedHash
+          }
+          console.log('ASSERTIONS=' + JSON.stringify(assertions))
+          if (Object.values(assertions).some(value => value !== true)) {
+            throw new Error('Synthetic protected-impact assertions did not all pass')
+          }
+          console.log('PROTECTED_SECRET_HASH_MATCH=true')
+          console.log('EXACT_RETAINED_FORK_HEAD_MATCH=true')
+          console.log('SECRET_PLAINTEXT_LOGGED=false')
+          NODE
